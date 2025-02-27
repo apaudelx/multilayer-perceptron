@@ -10,7 +10,6 @@ def main():
     # Load the Auto MPG dataset
     X, y = load_auto_mpg_data('data/auto-mpg/auto-mpg.data')
 
-    # Ensure that X and y are NumPy arrays (in case the loader returns a DataFrame)
     if not isinstance(X, np.ndarray):
         X = np.array(X)
     if not isinstance(y, np.ndarray):
