@@ -1,5 +1,4 @@
 import numpy as np
-import matplotlib.pyplot as plt
 from abc import ABC, abstractmethod
 from typing import Tuple
 
@@ -14,8 +13,11 @@ def batch_generator(train_x, train_y, batch_size):
 
     :return tuple: (batch_x, batch_y) where batch_x has shape (B, f) and batch_y has shape (B, q). The last batch may be smaller.
     """
-    pass
-
+    n = train_x.shape[0]
+    for i in range(0, n, batch_size):
+        batch_x = train_x[i:i + batch_size]
+        batch_y = train_y[i:i + batch_size]
+        yield batch_x, batch_y
 
 class ActivationFunction(ABC):
     @abstractmethod
@@ -39,14 +41,12 @@ class ActivationFunction(ABC):
         """
         pass
 
-
 class Sigmoid(ActivationFunction):
     def forward(self, x: np.ndarray) -> np.ndarray:
         return 1 / (1 + np.exp(-x))
 
     def derivative(self, x: np.ndarray) -> np.ndarray:
-        s = self.forward(x)
-        return s * (1 - s)
+        return np.exp(-x) / (1+np.exp(-x))**2
 
 class Tanh(ActivationFunction):
     def forward(self, x: np.ndarray) -> np.ndarray:
@@ -60,7 +60,7 @@ class Relu(ActivationFunction):
         return np.maximum(0, x)
     
     def derivative(self, x: np.ndarray) -> np.ndarray:
-        return np.where(x > 0, 1, 0)
+        return np.where(x >= 0, 1, 0)
 
 class Softmax(ActivationFunction):
     def forward(self, x: np.ndarray) -> np.ndarray:
@@ -69,7 +69,12 @@ class Softmax(ActivationFunction):
     
     def derivative(self, x: np.ndarray) -> np.ndarray:
         s = self.forward(x)
-        return s * (1 - s)
+        ssn, fsn = s.shape
+        jacobian =  np.zeros((ssn, fsn, fsn))
+        for i in range(ssn):
+            s_i = s[i].reshape(-1,1)
+            jacobian[i] = np.diagflat(s[i]) - np.dot(s_i, s_i.T)
+        return jacobian
 
 class Linear(ActivationFunction):
     def forward(self, x: np.ndarray) -> np.ndarray:
@@ -80,10 +85,10 @@ class Linear(ActivationFunction):
         
 class Softplus(ActivationFunction):
     def forward(self, x: np.ndarray) -> np.ndarray:
-        return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0)
+        return np.log(1 + np.exp(x))
     
     def derivative(self, x: np.ndarray) -> np.ndarray:
-        return 1 / (1 + np.exp(-x))    
+        return np.exp(x)/(1 + np.exp(x))
 
 class Mish(ActivationFunction):
     def forward(self, x: np.ndarray) -> np.ndarray:
@@ -105,26 +110,22 @@ class LossFunction(ABC):
     def derivative(self, y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
         pass
 
-
 class SquaredError(LossFunction):
     def loss(self, y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
-        pass
+        return 0.5 * np.sum((y_true - y_pred)**2, axis=1)
     
     def derivative(self, y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
-        pass
-
+        return (y_pred - y_true) / y_true.shape[0]
 
 class CrossEntropy(LossFunction):
     def loss(self, y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
-        y_pred = np.clip(y_pred, 1e-15, 1 - 1e-15)
-        return - y_true * np.log(y_pred) - (1 - y_true) * np.log(1 - y_pred)
-    
+        return -np.sum(y_true * np.log(y_pred), axis=1)
+
     def derivative(self, y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
-        y_pred = np.clip(y_pred, 1e-15, 1 - 1e-15)
-        return - (y_true / y_pred) + (1 - y_true) / (1 - y_pred)
+        return y_pred - y_true
 
 class Layer:
-    def __init__(self, fan_in: int, fan_out: int, activation_function: ActivationFunction):
+    def __init__(self, fan_in: int, fan_out: int, activation_function: ActivationFunction, dropout_rate: float = 0.0):
         """
         Initializes a layer of neurons
 
@@ -135,25 +136,35 @@ class Layer:
         self.fan_in = fan_in
         self.fan_out = fan_out
         self.activation_function = activation_function
-
-        # this will store the activations (forward prop)
-        self.activations = None
-        # this will store the delta term (dL_dPhi, backward prop)
-        self.delta = None
-
-        # Initialize weights and biaes
-        self.W = None  # weights
-        self.b = None  # biases
-
+        self.dropout_rate = dropout_rate
+        self.dropout_mask = None
+        self.is_training = True
+        
+        # He initialization for ReLU-like activations
+        if isinstance(activation_function, (Relu, Softplus, Mish)):
+            self.W = np.random.randn(fan_in, fan_out) * np.sqrt(2.0 / fan_in)
+        else:
+            limit = np.sqrt(6 / (fan_in + fan_out))
+            self.W = np.random.uniform(-limit, limit, (fan_in, fan_out))
+        self.b = np.zeros((1, fan_out))
+        self.z = None
+        
     def forward(self, h: np.ndarray):
         """
-        Computes the activations for this layer
+        Computes the activations for this layers
 
         :param h: input to layer
         :return: layer activations
         """
-        self.activations = None
-
+        weighted_sum = np.dot(h, self.W)  # Compute weighted input
+        self.z = weighted_sum + self.b     # Add bias term
+        self.activations = self.activation_function.forward(self.z)
+        
+        if self.is_training and self.dropout_rate > 0:
+            self.dropout_mask = np.random.binomial(1, 1 - self.dropout_rate,
+                                                    size=self.activations.shape)
+            return self.activations * self.dropout_mask / (1-self.dropout_rate)
+        
         return self.activations
 
     def backward(self, h: np.ndarray, delta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -164,11 +175,14 @@ class Layer:
         :param delta: delta term from layer above
         :return: (weight gradients, bias gradients)
         """
-        dL_dW = None
-        dL_db = None
-        self.delta = None
+        # If dropout was applied, ensure that the gradient respects the same mask.
+        if self.is_training and self.dropout_rate > 0 and self.dropout_mask is not None:
+            delta = delta * self.dropout_mask / (1 - self.dropout_rate)
+    
+        dL_dW = np.dot(h.T, delta) #Compute weight gradient
+        dL_db = np.sum(delta, axis=0, keepdims=True) #Compute bias gradient	
+        self.delta = delta #Store delta	
         return dL_dW, dL_db
-
 
 class MultilayerPerceptron:
     def __init__(self, layers: Tuple[Layer]):
@@ -184,8 +198,10 @@ class MultilayerPerceptron:
         :param x: network input
         :return: network output
         """
-
-        return None
+        current_output = x  # Start with the input data and stores the activations as they propagate through each layer.
+        for layer in self.layers:
+            current_output = layer.forward(current_output)
+        return current_output 
 
     def backward(self, loss_grad: np.ndarray, input_data: np.ndarray) -> Tuple[list, list]:
         """
@@ -194,13 +210,40 @@ class MultilayerPerceptron:
         :param input_data: network's input data
         :return: (List of weight gradients for all layers, List of bias gradients for all layers)
         """
-        dl_dw_all = []
-        dl_db_all = []
+        layers = self.layers
+        deltas = []
 
+        output_layer = layers[-1]
+        if isinstance(output_layer.activation_function, Softmax):
+            delta = loss_grad
+        else:
+            delta = loss_grad * output_layer.activation_function.derivative(output_layer.z)
+        deltas.insert(0, delta)
 
-        return None, None
+        for i in reversed(range(len(layers) - 1)):
+            current_layer = layers[i]
+            next_layer = layers[i + 1]
+            delta_next = deltas[0]
+            delta_current = (delta_next @ next_layer.W.T) * current_layer.activation_function.derivative(current_layer.z)
+            deltas.insert(0, delta_current)
 
-    def train(self, train_x: np.ndarray, train_y: np.ndarray, val_x: np.ndarray, val_y: np.ndarray, loss_func: LossFunction, learning_rate: float=1E-3, batch_size: int=16, epochs: int=32) -> Tuple[np.ndarray, np.ndarray]:
+        dl_dw_all, dl_db_all = [], []
+        for i, layer in enumerate(layers):
+            h_prev = input_data if i == 0 else layers[i - 1].activations
+            dL_dW, dL_db = layer.backward(h_prev, deltas[i])
+            dl_dw_all.append(dL_dW)
+            dl_db_all.append(dL_db)
+
+        return dl_dw_all, dl_db_all
+    
+    def set_training_mode(self, is_training:bool):
+        for layer in self.layers:
+            layer.is_training = is_training
+            
+    def train(self, train_x: np.ndarray, train_y: np.ndarray, 
+              val_x: np.ndarray, val_y: np.ndarray, 
+              loss_func: LossFunction, learning_rate: float=1E-3, 
+              batch_size: int=16, epochs: int=32, rmsprop: bool=False, beta: float=0.9, epsilon: float=1e-8, lr_decay: float=0.99, l2_lambda: float=0.01) -> Tuple[np.ndarray, np.ndarray]:
         """
         Train the multilayer perceptron
 
@@ -214,7 +257,78 @@ class MultilayerPerceptron:
         :param epochs: number of epochs
         :return:
         """
-        training_losses = None
-        validation_losses = None
+        print(learning_rate)
+        print(batch_size)
+        print(epochs)
+        
+        self.set_training_mode(True)
+        training_losses = []
+        validation_losses = []
+        n_samples = train_x.shape[0]
+        
+        # Initialize RMSProp accumulators
+        if rmsprop:
+            rmsprop_cache_w = [np.zeros_like(layer.W) for layer in self.layers]
+            rmsprop_cache_b = [np.zeros_like(layer.b) for layer in self.layers]
+            
+        best_val_loss = float('inf')
+        patience = 20
+        patience_counter = 0
+        for epoch in range(epochs):
+            # Shuffle data
+            permutation = np.random.permutation(n_samples)
+            train_x_shuffled, train_y_shuffled = train_x[permutation], train_y[permutation]
+            epoch_loss = 0.0
 
-        return training_losses, validation_losses
+            for batch_x, batch_y in batch_generator(train_x_shuffled, train_y_shuffled, batch_size):
+                # Forward pass
+                output = self.forward(batch_x)
+                # Compute loss
+                loss = np.mean(loss_func.loss(batch_y, output))
+                epoch_loss += loss
+                # Compute gradients
+                loss_grad = loss_func.derivative(batch_y, output)
+                grads_w, grads_b = self.backward(loss_grad, batch_x)
+                for i, (layer, grad_w, grad_b) in enumerate(zip(self.layers, grads_w, grads_b)):
+                    if rmsprop:
+                        # Update RMSProp cache
+                        rmsprop_cache_w[i] = beta * rmsprop_cache_w[i] + (1 - beta) * grad_w**2
+                        rmsprop_cache_b[i] = beta * rmsprop_cache_b[i] + (1 - beta) * grad_b**2
+
+                        # Update parameters using RMSProp
+                        layer.W -= learning_rate * grad_w / (np.sqrt(rmsprop_cache_w[i]) + epsilon)
+                        layer.b -= learning_rate * grad_b / (np.sqrt(rmsprop_cache_b[i]) + epsilon)
+                    else:
+                        # Vanilla SGD update
+                        layer.W -= learning_rate * grad_w
+                        layer.b -= learning_rate * grad_b
+                    # Apply L2 regularization
+                    layer.W -= learning_rate * l2_lambda * layer.W
+
+            # Calculate epoch losses
+            epoch_loss /= (n_samples / batch_size)
+            training_losses.append(epoch_loss)
+            # Validation loss
+            self.set_training_mode(False)
+            val_output = self.forward(val_x)
+            val_loss = np.mean(loss_func.loss(val_y, val_output))
+            validation_losses.append(val_loss)
+            self.set_training_mode(True)
+            
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch + 1}")
+                break
+            
+            learning_rate *= lr_decay
+            
+            # Print progress
+            print(f"Epoch {epoch + 1}/{epochs} - "
+                  f"Training Loss: {epoch_loss:.4f}, "
+                  f"Validation Loss: {val_loss:.4f}")
+            
+        return np.array(training_losses), np.array(validation_losses)
